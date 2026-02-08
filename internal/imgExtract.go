@@ -1,0 +1,5 @@
+package imgExtract
+
+func extractImages() {
+
+}
