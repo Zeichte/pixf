@@ -1,5 +1,0 @@
-package imgExtract
-
-func extractImages() {
-
-}
