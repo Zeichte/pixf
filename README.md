@@ -115,6 +115,7 @@ pixf --help
 - [ ] Image compression
 - [ ] Image cropping
 - [ ] Background removal
+- [ ] GUI and Windows support
 
 
 ## License
