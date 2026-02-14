@@ -8,6 +8,10 @@ pixf is a command-line tool built in Go that provides two primary functionalitie
 - **Unlock PDFs**: Remove password protection from PDF files
 - **Extract Images**: Extract all images from PDFs in your preferred format
 
+## Motivation
+While many PDF tools exist, none offered me a quick, command-line way to extract only unique images in the format I most commonly use. 
+This tool fills that gap by eliminating duplicate images and allowing to output files in a format in an efficient way, taking advantage of Go parallel processing.
+
 ## Features
 
 - 🔓 **Unlock PDFs** - Remove "Honor Mode" lock protection from PDF files
@@ -17,17 +21,13 @@ pixf is a command-line tool built in Go that provides two primary functionalitie
 - 🔄 **Deduplication** - Automatically removes duplicate images
 - 🖥️ **Simple CLI** - Easy-to-use command-line interface
 
-## Installation
+## Quick Start
 
 ### From Source
 
 ```bash
 # Clone the repository
-git clone https://github.com/yourusername/pixf.git
-cd pixf
-
-# Build the project
-go build -o pixf .
+go install https://github.com/n01nex/pixf
 
 # Optional: Add to PATH
 mv pixf /usr/local/bin/
