@@ -10,60 +10,45 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"strconv"
+	"runtime"
 	"strings"
 	"sync"
-	"sync/atomic"
 
 	"github.com/chai2010/webp"
 	"github.com/pdfcpu/pdfcpu/pkg/api"
 )
 
-// Buffer pool for encoding buffers to reduce allocations
+// Buffer pool for encoding to reduce allocations
 var bufferPool = sync.Pool{
-	New: func() interface{} {
-		return new(bytes.Buffer)
-	},
+	New: func() interface{} { return new(bytes.Buffer) },
 }
 
-// getBuffer gets a buffer from the pool
-func getBuffer() *bytes.Buffer {
-	return bufferPool.Get().(*bytes.Buffer)
-}
-
-// putBuffer returns a buffer to the pool
+func getBuffer() *bytes.Buffer { return bufferPool.Get().(*bytes.Buffer) }
 func putBuffer(buf *bytes.Buffer) {
 	buf.Reset()
 	bufferPool.Put(buf)
 }
 
-// ImageEncoder interface for encoding images
+// ImageEncoder interface
 type ImageEncoder interface {
 	Encode(w io.Writer, img *image.RGBA) error
 	Extension() string
 }
 
-// PNG encoder with transparency
+// Encoders
 type PNGEncoder struct{}
 
-func (e PNGEncoder) Encode(w io.Writer, img *image.RGBA) error {
-	enc := png.Encoder{CompressionLevel: png.NoCompression}
-	return enc.Encode(w, img)
+func (PNGEncoder) Encode(w io.Writer, img *image.RGBA) error {
+	return png.Encoder{CompressionLevel: png.NoCompression}.Encode(w, img)
 }
+func (PNGEncoder) Extension() string { return ".png" }
 
-func (e PNGEncoder) Extension() string { return ".png" }
-
-// WebP encoder with transparency
 type WebPEncoder struct{}
 
-func (e WebPEncoder) Encode(w io.Writer, img *image.RGBA) error {
-	return webp.Encode(w, img, &webp.Options{
-		Lossless: true,
-		Quality:  100,
-	})
+func (WebPEncoder) Encode(w io.Writer, img *image.RGBA) error {
+	return webp.Encode(w, img, &webp.Options{Lossless: true, Quality: 100})
 }
-
-func (e WebPEncoder) Extension() string { return ".webp" }
+func (WebPEncoder) Extension() string { return ".webp" }
 
 // Encoder registry
 var encoderRegistry = map[string]ImageEncoder{
@@ -71,17 +56,16 @@ var encoderRegistry = map[string]ImageEncoder{
 	"webp": WebPEncoder{},
 }
 
-// GetEncoder returns encoder for the given format
+// GetEncoder returns encoder for given format
 func GetEncoder(format string) (ImageEncoder, error) {
 	format = strings.ToLower(format)
-	encoder, ok := encoderRegistry[format]
-	if !ok {
-		return nil, fmt.Errorf("unsupported format: %s", format)
+	if enc, ok := encoderRegistry[format]; ok {
+		return enc, nil
 	}
-	return encoder, nil
+	return nil, fmt.Errorf("unsupported format: %s", format)
 }
 
-// Convert image to RGBA for transparency support
+// toRGBA converts any image to RGBA
 func toRGBA(img image.Image) *image.RGBA {
 	if rgba, ok := img.(*image.RGBA); ok {
 		return rgba
@@ -92,274 +76,178 @@ func toRGBA(img image.Image) *image.RGBA {
 	return rgba
 }
 
-// LoadedImage represents an image loaded from disk
+// LoadedImage holds image data for processing
 type LoadedImage struct {
-	Img      *image.RGBA // Pre-converted to RGBA for transparency support
-	FileHash string      // Store only hash instead of full file data for deduplication
+	OrigName string      // Original filename for "original" format
+	Img      *image.RGBA // Decoded RGBA (for conversion)
+	RawData  []byte      // Original bytes (for "original" format)
+	FileHash string
 }
 
-// ExtractImagesFromFile extracts images from a PDF file
-// For 'original' format, uses PDFCPU's ExtractImageFile for native format
-// For 'png' and 'webp', converts images with transparency support
+// ExtractImagesFromFile extracts images from a PDF
+// For "original": saves native format with deduplication
+// For "png"/"webp": decodes, converts, and encodes with concurrency
 func ExtractImagesFromFile(filename string, imgDir string, format string) error {
 	if err := os.Mkdir(imgDir, 0755); err != nil && !os.IsExist(err) {
 		return err
 	}
 
-	// For original format, use PDFCPU's native extraction with deduplication
-	if format == "original" || format == "" {
-		return extractImagesOriginal(filename, imgDir)
+	// Extract to temp directory
+	tempDir, err := os.MkdirTemp("", "pdfimg")
+	if err != nil {
+		return fmt.Errorf("create temp dir: %w", err)
+	}
+	defer os.RemoveAll(tempDir)
+
+	if err := api.ExtractImagesFile(filename, tempDir, nil, nil); err != nil {
+		return fmt.Errorf("extract images: %w", err)
 	}
 
-	// For other formats (png, webp), use concurrent processing
+	// Load all images (single read per file)
+	images, err := loadImages(tempDir)
+	if err != nil {
+		return err
+	}
+
+	if len(images) == 0 {
+		return nil
+	}
+
+	// Deduplicate
+	images = deduplicate(images)
+
+	// Process based on format
+	format = strings.ToLower(format)
+	if format == "original" || format == "" {
+		return saveOriginal(images, imgDir)
+	}
+
 	encoder, err := GetEncoder(format)
 	if err != nil {
 		return err
 	}
 
-	return extractImagesConcurrent(filename, imgDir, encoder)
+	return saveConverted(images, imgDir, encoder)
 }
 
-// extractImagesOriginal uses PDFCPU's ExtractImageFile for native format with deduplication
-func extractImagesOriginal(filename string, imgDir string) error {
-	// Extract images to temp directory
-	tempDir, err := os.MkdirTemp("", "pdfimg")
+// loadImages reads and decodes all image files
+func loadImages(dir string) ([]LoadedImage, error) {
+	files, err := os.ReadDir(dir)
 	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	if err := api.ExtractImagesFile(filename, tempDir, nil, nil); err != nil {
-		return fmt.Errorf("api.ExtractImagesFile: %w", err)
+		return nil, fmt.Errorf("read dir: %w", err)
 	}
 
-	// Read and process extracted images
-	files, err := os.ReadDir(tempDir)
-	if err != nil {
-		return fmt.Errorf("read temp dir: %w", err)
-	}
-
-	return processExtractedFilesSequential(files, tempDir, imgDir)
-}
-
-// extractImagesConcurrent extracts images using concurrent goroutines
-func extractImagesConcurrent(filename string, imgDir string, encoder ImageEncoder) error {
-	// Extract images to temp directory
-	tempDir, err := os.MkdirTemp("", "pdfimg")
-	if err != nil {
-		return fmt.Errorf("create temp dir: %w", err)
-	}
-	defer os.RemoveAll(tempDir)
-
-	if err := api.ExtractImagesFile(filename, tempDir, nil, nil); err != nil {
-		return fmt.Errorf("api.ExtractImagesFile: %w", err)
-	}
-
-	// Read all image files first
-	files, err := os.ReadDir(tempDir)
-	if err != nil {
-		return fmt.Errorf("read temp dir: %w", err)
-	}
-
-	// Collect image data with file hash for deduplication (single read per file)
-	loadedImages := make([]LoadedImage, 0, len(files))
-
+	var images []LoadedImage
 	for _, f := range files {
 		if !isImageFile(f.Name()) {
 			continue
 		}
 
-		imgPath := filepath.Join(tempDir, f.Name())
-
-		// Single read: read file once, use for both decoding and hashing
-		fileData, err := os.ReadFile(imgPath)
+		path := filepath.Join(dir, f.Name())
+		data, err := os.ReadFile(path)
 		if err != nil {
-			return fmt.Errorf("read file data: %w", err)
+			return nil, fmt.Errorf("read %s: %w", f.Name(), err)
 		}
 
-		// Decode image and convert to RGBA immediately
-		rawImg, _, err := image.Decode(bytes.NewReader(fileData))
+		// Decode and convert to RGBA
+		img, _, err := image.Decode(bytes.NewReader(data))
 		if err != nil {
-			return fmt.Errorf("decode image: %w", err)
+			continue // Skip undecodable files
 		}
 
-		// Convert to RGBA once upfront for encoding efficiency
-		rgba := toRGBA(rawImg)
-
-		// Compute hash immediately, release fileData reference after hash
-		hash := hashBytes(fileData)
-
-		loadedImages = append(loadedImages, LoadedImage{
-			Img:      rgba,
-			FileHash: hash,
+		images = append(images, LoadedImage{
+			OrigName: f.Name(),
+			Img:      toRGBA(img),
+			RawData:  data,
+			FileHash: hashBytes(data),
 		})
 	}
-
-	if len(loadedImages) == 0 {
-		return nil
-	}
-
-	// Deduplicate using pre-computed hashes
-	seen := make(map[string]bool)
-	dupCount := 0
-	uniqueImages := make([]LoadedImage, 0, len(loadedImages))
-
-	for _, li := range loadedImages {
-		if seen[li.FileHash] {
-			dupCount++
-			continue
-		}
-		seen[li.FileHash] = true
-		uniqueImages = append(uniqueImages, li)
-	}
-
-	if dupCount > 0 {
-		fmt.Printf("skipped %d duplicate image(s)\n", dupCount)
-	}
-
-	// Process unique images concurrently
-	return processImagesConcurrently(uniqueImages, imgDir, encoder)
+	return images, nil
 }
 
-// processImagesConcurrently processes images with concurrent encoding
-func processImagesConcurrently(loadedImages []LoadedImage, imgDir string, encoder ImageEncoder) error {
-	type WriteTask struct {
-		Index int
-		Img   *image.RGBA
+// deduplicate removes duplicate images by hash
+func deduplicate(images []LoadedImage) []LoadedImage {
+	seen := make(map[string]bool)
+	var unique []LoadedImage
+
+	for _, img := range images {
+		if !seen[img.FileHash] {
+			seen[img.FileHash] = true
+			unique = append(unique, img)
+		}
 	}
 
-	// Create tasks
-	tasks := make([]WriteTask, 0, len(loadedImages))
-	for i, li := range loadedImages {
-		tasks = append(tasks, WriteTask{
-			Index: i,
-			Img:   li.Img,
-		})
+	if len(unique) < len(images) {
+		fmt.Printf("skipped %d duplicate(s)\n", len(images)-len(unique))
+	}
+	return unique
+}
+
+// saveOriginal copies raw files preserving original format
+func saveOriginal(images []LoadedImage, imgDir string) error {
+	for i, img := range images {
+		ext := strings.ToLower(filepath.Ext(img.OrigName))
+		if ext == "" {
+			ext = ".png"
+		}
+		path := filepath.Join(imgDir, fmt.Sprintf("image_%04d%s", i+1, ext))
+		if err := os.WriteFile(path, img.RawData, 0644); err != nil {
+			return fmt.Errorf("write %s: %w", path, err)
+		}
+	}
+	return nil
+}
+
+// saveConverted encodes images concurrently using all available CPUs
+func saveConverted(images []LoadedImage, imgDir string, encoder ImageEncoder) error {
+	numWorkers := runtime.NumCPU()
+
+	type task struct {
+		index int
+		img   *image.RGBA
 	}
 
-	// Get configurable worker count from environment variable or use default
-	numWorkers := getWorkerCount()
-	taskChan := make(chan WriteTask, len(tasks))
-	resultChan := make(chan error, len(tasks))
+	tasks := make(chan task, len(images))
+	results := make(chan error, len(images))
+
 	var wg sync.WaitGroup
-	var failed atomic.Bool
 
-	// Start worker goroutines
+	// Start workers
 	for i := 0; i < numWorkers; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			for task := range taskChan {
-				// Skip processing if already failed
-				if failed.Load() {
-					return
-				}
-				err := writeImageFile(task.Img, encoder, imgDir, task.Index)
-				if err != nil {
-					failed.Store(true)
-					resultChan <- err
-				} else {
-					resultChan <- nil
-				}
+			for t := range tasks {
+				results <- encodeImage(t.img, encoder, imgDir, t.index)
 			}
 		}()
 	}
 
-	// Send all tasks to workers
-	for _, task := range tasks {
-		taskChan <- task
-	}
-	close(taskChan)
-
-	// Wait for all workers to complete
+	// Dispatch tasks
 	go func() {
-		wg.Wait()
-		close(resultChan)
+		for i, img := range images {
+			tasks <- task{index: i, img: img.Img}
+		}
+		close(tasks)
 	}()
 
-	// Collect first error
-	var sendErr error
-	for err := range resultChan {
-		if err != nil && sendErr == nil {
-			sendErr = err
+	// Wait and collect first error
+	go func() {
+		wg.Wait()
+		close(results)
+	}()
+
+	var firstErr error
+	for err := range results {
+		if err != nil && firstErr == nil {
+			firstErr = err
 		}
 	}
-
-	return sendErr
+	return firstErr
 }
 
-// getWorkerCount returns the number of workers from environment variable or default
-func getWorkerCount() int {
-	if val := os.Getenv("PIXF_WORKERS"); val != "" {
-		if n, err := strconv.Atoi(val); err == nil && n > 0 {
-			return n
-		}
-	}
-	return 4 // default worker count
-}
-
-// processExtractedFilesSequential processes all files sequentially for original format
-func processExtractedFilesSequential(files []os.DirEntry, tempDir string, imgDir string) error {
-	seen := make(map[string]bool)
-	var dupCount int
-	uniqueCount := 0
-
-	for _, f := range files {
-		if f.IsDir() || !isImageFile(f.Name()) {
-			continue
-		}
-
-		imgPath := filepath.Join(tempDir, f.Name())
-
-		// Read file content for deduplication
-		fileData, err := os.ReadFile(imgPath)
-		if err != nil {
-			return fmt.Errorf("read image: %w", err)
-		}
-
-		// Hash the raw file content for deduplication
-		hash := hashBytes(fileData)
-
-		if seen[hash] {
-			dupCount++
-			continue
-		}
-		seen[hash] = true
-
-		// Copy the file directly preserving original extension
-		origExt := strings.ToLower(filepath.Ext(f.Name()))
-		if origExt == "" {
-			origExt = ".png"
-		}
-		dstPath := filepath.Join(imgDir, fmt.Sprintf("image_%04d%s", uniqueCount, origExt))
-		if err := os.WriteFile(dstPath, fileData, 0644); err != nil {
-			return fmt.Errorf("write image: %w", err)
-		}
-		uniqueCount++
-	}
-
-	if dupCount > 0 {
-		fmt.Printf("skipped %d duplicate image(s)\n", dupCount)
-	}
-
-	return nil
-}
-
-// isImageFile checks if a filename has an image extension
-func isImageFile(filename string) bool {
-	ext := strings.ToLower(filepath.Ext(filename))
-	return ext == ".png" || ext == ".jpg" || ext == ".jpeg" || ext == ".gif" || ext == ".bmp" || ext == ".tiff" || ext == ".webp"
-}
-
-// hashBytes computes SHA-256 hash of byte slice
-func hashBytes(data []byte) string {
-	h := sha256.New()
-	h.Write(data)
-	return fmt.Sprintf("%x", h.Sum(nil))
-}
-
-// writeImageFile writes an encoded image to disk using buffer pooling
-func writeImageFile(img *image.RGBA, encoder ImageEncoder, imgDir string, index int) error {
+// encodeImage encodes a single image to disk
+func encodeImage(img *image.RGBA, encoder ImageEncoder, imgDir string, index int) error {
 	buf := getBuffer()
 	defer putBuffer(buf)
 
@@ -367,9 +255,20 @@ func writeImageFile(img *image.RGBA, encoder ImageEncoder, imgDir string, index 
 		return fmt.Errorf("encode: %w", err)
 	}
 
-	ext := encoder.Extension()
-	outName := fmt.Sprintf("image_%04d%s", index+1, ext)
-	outPath := filepath.Join(imgDir, outName)
-
+	outPath := filepath.Join(imgDir, fmt.Sprintf("image_%04d%s", index+1, encoder.Extension()))
 	return os.WriteFile(outPath, buf.Bytes(), 0644)
+}
+
+// isImageFile checks if filename has image extension
+func isImageFile(name string) bool {
+	ext := strings.ToLower(filepath.Ext(name))
+	return ext == ".png" || ext == ".jpg" || ext == ".jpeg" ||
+		ext == ".gif" || ext == ".bmp" || ext == ".tiff" || ext == ".webp"
+}
+
+// hashBytes computes SHA-256 of data
+func hashBytes(data []byte) string {
+	h := sha256.New()
+	h.Write(data)
+	return fmt.Sprintf("%x", h.Sum(nil))
 }
